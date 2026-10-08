@@ -188,22 +188,24 @@ static const struct snd_pcm_ops gip_headset_pcm_ops = {
 static bool gip_headset_advance_pointer(struct gip_headset_stream *stream,
 					int len, size_t buf_size)
 {
-	snd_pcm_uframes_t period = stream->substream->runtime->period_size;
+	size_t period_bytes = frames_to_bytes(stream->substream->runtime,
+					     stream->substream->runtime->period_size);
+	bool elapsed = false;
 
 	stream->pointer += len;
 	if (stream->pointer >= buf_size)
 		stream->pointer -= buf_size;
 
 	stream->period += len;
-	if (stream->period >= period) {
-		stream->period -= period;
-		return true;
+	while (period_bytes && stream->period >= period_bytes) {
+		stream->period -= period_bytes;
+		elapsed = true;
 	}
 
-	return false;
+	return elapsed;
 }
 
-static bool gip_headset_copy_playback(struct gip_headset_stream *stream,
+static void gip_headset_copy_playback(struct gip_headset_stream *stream,
 				      unsigned char *data, int len)
 {
 	unsigned char *src = stream->substream->runtime->dma_area;
@@ -216,8 +218,6 @@ static bool gip_headset_copy_playback(struct gip_headset_stream *stream,
 		memcpy(data, src + stream->pointer, remaining);
 		memcpy(data + remaining, src, len - remaining);
 	}
-
-	return gip_headset_advance_pointer(stream, len, buf_size);
 }
 
 static bool gip_headset_copy_capture(struct gip_headset_stream *stream,
@@ -242,8 +242,10 @@ static enum hrtimer_restart gip_headset_send_samples(struct hrtimer *timer)
 	struct gip_headset *headset = container_of(timer, typeof(*headset),
 						   timer);
 	struct gip_audio_config *cfg = &headset->client->audio_config_out;
-	struct snd_pcm_substream *sub = headset->playback.substream;
+	struct snd_pcm_substream *sub = READ_ONCE(headset->playback.substream);
 	bool elapsed = false;
+	bool playback_active = false;
+	bool send_attempted = false;
 	int err;
 	unsigned long flags;
 
@@ -253,18 +255,41 @@ static enum hrtimer_restart gip_headset_send_samples(struct hrtimer *timer)
 	if (sub) {
 		snd_pcm_stream_lock_irqsave(sub, flags);
 
-		if (sub->runtime && snd_pcm_running(sub))
-			elapsed = gip_headset_copy_playback(&headset->playback,
-							    headset->buffer,
-							    cfg->buffer_size);
+		/* Serialize the entire copy/submit/advance with START and STOP. */
+		if (headset->playback.substream == sub && sub->runtime &&
+		    snd_pcm_running(sub)) {
+			playback_active = true;
+			if (READ_ONCE(headset->got_authenticated)) {
+				gip_headset_copy_playback(&headset->playback,
+							  headset->buffer,
+							  cfg->buffer_size);
+				err = gip_send_audio_samples(headset->client,
+							    headset->buffer);
+				send_attempted = true;
+				if (!err)
+					elapsed = gip_headset_advance_pointer(
+						&headset->playback,
+						cfg->buffer_size,
+						snd_pcm_lib_buffer_bytes(sub));
+			}
+		}
 
 		snd_pcm_stream_unlock_irqrestore(sub, flags);
 
+		if (send_attempted)
+			gip_headset_log_resume_event(
+				headset, &headset->resume_audio_output_count,
+				10000, "playback-submit", err);
+
 		if (elapsed)
 			snd_pcm_period_elapsed(sub);
+
+		if (send_attempted && err && err != -ENOSPC)
+			return HRTIMER_NORESTART;
 	}
 
-	if (headset->got_authenticated) {
+	if (READ_ONCE(headset->got_authenticated) && !playback_active &&
+	    !send_attempted) {
 		/* retry if driver runs out of buffers */
 		err = gip_send_audio_samples(headset->client, headset->buffer);
 		gip_headset_log_resume_event(headset,
