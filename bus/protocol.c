@@ -475,22 +475,32 @@ static int gip_request_identification(struct gip_client *client)
 int gip_reinitialize_client(struct gip_client *client)
 {
 	struct gip_adapter *adap = client->adapter;
-	struct gip_hardware hardware = client->hardware;
+	struct gip_hardware hardware;
 	struct gip_client *replacement;
-	u8 id = client->id;
+	unsigned long flags;
+	u8 id;
 	int err;
 
-	if (READ_ONCE(adap->clients[id]) != client)
-		return -ENODEV;
+	/* Serialize the complete slot swap against atomic USB/wireless RX. */
+	spin_lock_irqsave(&adap->clients_lock, flags);
+	id = client->id;
+	if (adap->shutting_down || id >= GIP_MAX_CLIENTS ||
+	    adap->clients[id] != client) {
+		err = -ENODEV;
+		goto unlock;
+	}
+	hardware = client->hardware;
 
 	gip_info(client,
 		 "%s: removing client %u and requesting a fresh identity\n",
 		 __func__, id);
-	gip_remove_client(client);
+	gip_remove_client_locked(client);
 
-	replacement = gip_get_client(adap, id);
-	if (IS_ERR(replacement))
-		return PTR_ERR(replacement);
+	replacement = gip_get_client_locked(adap, id);
+	if (IS_ERR(replacement)) {
+		err = PTR_ERR(replacement);
+		goto unlock;
+	}
 
 	/* IDENTIFY can arrive before another ANNOUNCE restores these fields. */
 	replacement->hardware = hardware;
@@ -498,6 +508,8 @@ int gip_reinitialize_client(struct gip_client *client)
 	if (err)
 		gip_err(replacement, "%s: identify request failed: %d\n",
 			__func__, err);
+unlock:
+	spin_unlock_irqrestore(&adap->clients_lock, flags);
 	return err;
 }
 EXPORT_SYMBOL_GPL(gip_reinitialize_client);
@@ -1232,7 +1244,7 @@ static int gip_handle_pkt_status(struct gip_client *client,
 		gip_warn(client,
 			 "%s: client %u status=0x%02x indicates disconnected; queuing client removal\n",
 			 __func__, client->id, pkt->status);
-		gip_remove_client(client);
+		gip_remove_client_locked(client);
 		return 0;
 	}
 
@@ -1332,7 +1344,7 @@ static int gip_handle_pkt_identify(struct gip_client *client,
 	if (err)
 		goto err_free_info;
 
-	gip_add_client(client);
+	gip_add_client_locked(client);
 
 	return 0;
 
@@ -1777,16 +1789,29 @@ int gip_process_buffer(struct gip_adapter *adap, void *data, int len)
 {
 	struct gip_header hdr;
 	struct gip_client *client;
-	int hdr_len, err;
+	unsigned long flags;
+	int hdr_len, err = 0;
+
+	/* RX handlers and transport sends here must remain atomic/non-sleeping. */
+	spin_lock_irqsave(&adap->clients_lock, flags);
+	if (adap->shutting_down) {
+		err = -ESHUTDOWN;
+		goto unlock;
+	}
 
 	while (len > GIP_HDR_MIN_LENGTH) {
 		hdr_len = gip_decode_header(&hdr, data, len);
-		if (len < hdr_len + hdr.packet_length)
-			return -EINVAL;
+		if (len < hdr_len + hdr.packet_length) {
+			err = -EINVAL;
+			goto unlock;
+		}
 
-		client = gip_get_client(adap, hdr.options & GIP_HDR_CLIENT_ID);
-		if (IS_ERR(client))
-			return PTR_ERR(client);
+		client = gip_get_client_locked(adap,
+					       hdr.options & GIP_HDR_CLIENT_ID);
+		if (IS_ERR(client)) {
+			err = PTR_ERR(client);
+			goto unlock;
+		}
 
 		err = gip_process_pkt(client, &hdr, data + hdr_len);
 		if (err) {
@@ -1795,13 +1820,15 @@ int gip_process_buffer(struct gip_adapter *adap, void *data, int len)
 					 "%s: audio-control packet processing failed (options=0x%02x sequence=%u length=%u): %d\n",
 					 __func__, hdr.options, hdr.sequence,
 					 hdr.packet_length, err);
-			return err;
+			goto unlock;
 		}
 
 		data += hdr_len + hdr.packet_length;
 		len -= hdr_len + hdr.packet_length;
 	}
 
-	return 0;
+unlock:
+	spin_unlock_irqrestore(&adap->clients_lock, flags);
+	return err;
 }
 EXPORT_SYMBOL_GPL(gip_process_buffer);
