@@ -122,6 +122,7 @@ int gip_power_off_adapter(struct gip_adapter *adap);
 void gip_destroy_adapter(struct gip_adapter *adap);
 
 struct gip_client *gip_get_client(struct gip_adapter *adap, u8 id);
+int gip_reinitialize_client(struct gip_client *client);
 void gip_add_client(struct gip_client *client);
 void gip_remove_client(struct gip_client *client);
 void gip_free_client_info(struct gip_client *client);

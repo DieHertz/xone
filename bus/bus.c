@@ -105,6 +105,8 @@ static void gip_bus_remove(struct device *dev)
 
 	drv = client->drv;
 	if (drv) {
+		dev_info(dev, "GIP client %u unbinding driver %s\n",
+			 client->id, drv->name);
 		client->drv = NULL;
 		if (drv->remove)
 			drv->remove(client);
@@ -285,6 +287,9 @@ void gip_add_client(struct gip_client *client)
 
 void gip_remove_client(struct gip_client *client)
 {
+	dev_info(&client->adapter->dev,
+		 "GIP client %u removal requested; queueing unregister\n",
+		 client->id);
 	client->adapter->clients[client->id] = NULL;
 	queue_work(client->adapter->clients_wq, &client->work_unregister);
 }

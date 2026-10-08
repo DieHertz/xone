@@ -27,6 +27,7 @@
 #define GIP_VKEY_LEFT_WIN 0x5b
 
 #define gip_dbg(client, ...) dev_dbg(&(client)->adapter->dev, __VA_ARGS__)
+#define gip_info(client, ...) dev_info(&(client)->adapter->dev, __VA_ARGS__)
 #define gip_warn(client, ...) dev_warn(&(client)->adapter->dev, __VA_ARGS__)
 #define gip_err(client, ...) dev_err(&(client)->adapter->dev, __VA_ARGS__)
 
@@ -470,6 +471,36 @@ static int gip_request_identification(struct gip_client *client)
 
 	return gip_send_pkt(client, &hdr, NULL);
 }
+
+int gip_reinitialize_client(struct gip_client *client)
+{
+	struct gip_adapter *adap = client->adapter;
+	struct gip_hardware hardware = client->hardware;
+	struct gip_client *replacement;
+	u8 id = client->id;
+	int err;
+
+	if (READ_ONCE(adap->clients[id]) != client)
+		return -ENODEV;
+
+	gip_info(client,
+		 "%s: removing client %u and requesting a fresh identity\n",
+		 __func__, id);
+	gip_remove_client(client);
+
+	replacement = gip_get_client(adap, id);
+	if (IS_ERR(replacement))
+		return PTR_ERR(replacement);
+
+	/* IDENTIFY can arrive before another ANNOUNCE restores these fields. */
+	replacement->hardware = hardware;
+	err = gip_request_identification(replacement);
+	if (err)
+		gip_err(replacement, "%s: identify request failed: %d\n",
+			__func__, err);
+	return err;
+}
+EXPORT_SYMBOL_GPL(gip_reinitialize_client);
 
 int gip_set_power_mode(struct gip_client *client, enum gip_power_mode mode)
 {
@@ -1158,6 +1189,11 @@ static int gip_handle_pkt_announce(struct gip_client *client,
 	if (len != sizeof(*pkt))
 		return -EINVAL;
 
+	gip_info(client,
+		 "%s: ANNOUNCE client %u vendor=0x%04x product=0x%04x\n",
+		 __func__, client->id, le16_to_cpu(pkt->vendor_id),
+		 le16_to_cpu(pkt->product_id));
+
 	if (!hw->vendor && !hw->product && !hw->version) {
 		hw->vendor = le16_to_cpu(pkt->vendor_id);
 		hw->product = le16_to_cpu(pkt->product_id);
@@ -1193,7 +1229,9 @@ static int gip_handle_pkt_status(struct gip_client *client,
 		return -EINVAL;
 
 	if (!(pkt->status & GIP_STATUS_CONNECTED)) {
-		gip_dbg(client, "%s: disconnected\n", __func__);
+		gip_warn(client,
+			 "%s: client %u status=0x%02x indicates disconnected; queuing client removal\n",
+			 __func__, client->id, pkt->status);
 		gip_remove_client(client);
 		return 0;
 	}
@@ -1252,7 +1290,7 @@ static int gip_handle_pkt_identify(struct gip_client *client,
 				   void *data, u32 len)
 {
 	struct gip_pkt_identify *pkt = data;
-	int err;
+	int err = 0;
 
 	if (len < sizeof(*pkt))
 		return -EINVAL;
@@ -1349,15 +1387,23 @@ static int gip_handle_pkt_audio_format_chat(struct gip_client *client,
 	struct gip_pkt_audio_format_chat *pkt = data;
 	struct gip_audio_config *in = &client->audio_config_in;
 	struct gip_audio_config *out = &client->audio_config_out;
-	int err;
+	int err = 0;
 
 	if (len != sizeof(*pkt))
 		return -EINVAL;
 
+	gip_info(client,
+		 "%s: received chat audio-format packet raw=0x%02x, buffers in=%u out=%u\n",
+		 __func__, pkt->in_out, in->buffer_size, out->buffer_size);
+
 	/* chat headsets apparently default to 24 kHz */
 	if (pkt->in_out != GIP_AUD_FORMAT_12KHZ_STEREO ||
-	    in->buffer_size || out->buffer_size)
+	    in->buffer_size || out->buffer_size) {
+		gip_warn(client,
+			 "%s: rejecting chat format packet (raw=0x%02x, buffers in=%u out=%u)\n",
+			 __func__, pkt->in_out, in->buffer_size, out->buffer_size);
 		return -EPROTO;
+	}
 
 	err = gip_make_audio_config(client, in);
 	if (err)
@@ -1404,14 +1450,43 @@ static int gip_handle_pkt_audio_format(struct gip_client *client,
 	struct gip_pkt_audio_format *pkt = data;
 	struct gip_audio_config *in = &client->audio_config_in;
 	struct gip_audio_config *out = &client->audio_config_out;
-	int err;
+	int err = 0;
 
 	if (len != sizeof(*pkt))
 		return -EINVAL;
 
+	gip_info(client,
+		 "%s: received audio-format packet in=0x%02x out=0x%02x, buffers in=%u out=%u\n",
+		 __func__, pkt->in, pkt->out, in->buffer_size, out->buffer_size);
+
 	/* format has already been accepted */
-	if (in->buffer_size || out->buffer_size)
+	if (in->buffer_size || out->buffer_size) {
+		/*
+		 * The host may request the current format again after resume to
+		 * restart the headset audio handshake without removing the GIP
+		 * client. A matching report is confirmation, not a new format.
+		 */
+		if (pkt->in == in->format && pkt->out == out->format) {
+			gip_info(client,
+				 "%s: matching audio format reconfirmed; restarting audio-ready callback\n",
+				 __func__);
+
+			if (down_trylock(&client->drv_lock))
+				return -EBUSY;
+
+			if (client->drv && client->drv->ops.audio_ready)
+				err = client->drv->ops.audio_ready(client);
+
+			up(&client->drv_lock);
+			return err;
+		}
+
+		gip_warn(client,
+			 "%s: rejecting repeated audio format (in=0x%02x out=0x%02x; active buffers in=%u out=%u)\n",
+			 __func__, pkt->in, pkt->out,
+			 in->buffer_size, out->buffer_size);
 		return -EPROTO;
+	}
 
 	/* client rejected format, accept new format */
 	if (pkt->in != in->format || pkt->out != out->format) {
@@ -1562,6 +1637,18 @@ static int gip_handle_pkt_firmware(struct gip_client *client, void *data,
 static int gip_dispatch_pkt(struct gip_client *client,
 			    struct gip_header *hdr, void *data, u32 len)
 {
+	if (hdr->command == GIP_CMD_AUDIO_CONTROL) {
+		if (len)
+			gip_info(client,
+				 "%s: audio-control dispatch options=0x%02x sequence=%u length=%u subcommand=0x%02x\n",
+				 __func__, hdr->options, hdr->sequence, len,
+				 *(u8 *)data);
+		else
+			gip_warn(client,
+				 "%s: empty audio-control packet options=0x%02x sequence=%u\n",
+				 __func__, hdr->options, hdr->sequence);
+	}
+
 	if (hdr->options & GIP_OPT_INTERNAL) {
 		switch (hdr->command) {
 		case GIP_CMD_ACKNOWLEDGE:
@@ -1702,8 +1789,14 @@ int gip_process_buffer(struct gip_adapter *adap, void *data, int len)
 			return PTR_ERR(client);
 
 		err = gip_process_pkt(client, &hdr, data + hdr_len);
-		if (err)
+		if (err) {
+			if (hdr.command == GIP_CMD_AUDIO_CONTROL)
+				gip_warn(client,
+					 "%s: audio-control packet processing failed (options=0x%02x sequence=%u length=%u): %d\n",
+					 __func__, hdr.options, hdr.sequence,
+					 hdr.packet_length, err);
 			return err;
+		}
 
 		data += hdr_len + hdr.packet_length;
 		len -= hdr_len + hdr.packet_length;

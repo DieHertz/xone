@@ -5,6 +5,8 @@
 
 #include <linux/module.h>
 #include <linux/hrtimer.h>
+#include <linux/atomic.h>
+#include <linux/pm.h>
 #include <linux/version.h>
 #include <sound/core.h>
 #include <sound/initval.h>
@@ -52,8 +54,17 @@ struct gip_headset {
 
 	struct work_struct work_config;
 	struct delayed_work work_power_on;
+	struct delayed_work work_reinitialize;
 	struct work_struct work_register;
 	bool got_authenticated;
+	bool audio_initialized;
+	bool suspended;
+	bool resume_tracking;
+	atomic_t resume_audio_ready_count;
+	atomic_t resume_audio_volume_count;
+	atomic_t resume_audio_input_count;
+	atomic_t resume_audio_output_count;
+	atomic_t resume_power_on_count;
 	int start_counter;
 	bool got_initial_volume;
 	bool got_audio_packet;
@@ -68,6 +79,23 @@ struct gip_headset {
 		snd_pcm_uframes_t period;
 	} playback, capture;
 };
+
+static void gip_headset_log_resume_event(struct gip_headset *headset,
+					 atomic_t *counter,
+					 unsigned int log_every,
+					 const char *event, int value)
+{
+	int count;
+
+	if (!READ_ONCE(headset->resume_tracking))
+		return;
+
+	count = atomic_inc_return(counter);
+	if (count == 1 || count % log_every == 0)
+		dev_info(&headset->client->dev,
+			 "PM resume audio: %s count=%d value=%d\n",
+			 event, count, value);
+}
 
 static int gip_headset_pcm_open(struct snd_pcm_substream *sub)
 {
@@ -219,6 +247,9 @@ static enum hrtimer_restart gip_headset_send_samples(struct hrtimer *timer)
 	int err;
 	unsigned long flags;
 
+	if (READ_ONCE(headset->suspended))
+		return HRTIMER_NORESTART;
+
 	if (sub) {
 		snd_pcm_stream_lock_irqsave(sub, flags);
 
@@ -236,6 +267,9 @@ static enum hrtimer_restart gip_headset_send_samples(struct hrtimer *timer)
 	if (headset->got_authenticated) {
 		/* retry if driver runs out of buffers */
 		err = gip_send_audio_samples(headset->client, headset->buffer);
+		gip_headset_log_resume_event(headset,
+					     &headset->resume_audio_output_count,
+					     10000, "playback-submit", err);
 		if (err && err != -ENOSPC)
 			return HRTIMER_NORESTART;
 	}
@@ -257,6 +291,9 @@ static enum hrtimer_restart gip_headset_start_audio(struct hrtimer *timer)
 		container_of(timer, typeof(*headset), start_audio_timer);
 	int err;
 
+	if (READ_ONCE(headset->suspended))
+		return HRTIMER_NORESTART;
+
 	/*
 	 * check if the number of retries are elapsed (5) :
 	 * start audio anyway
@@ -272,8 +309,9 @@ static enum hrtimer_restart gip_headset_start_audio(struct hrtimer *timer)
 			__func__, headset->start_counter, GIP_HS_MAX_RETRIES,
 			headset->got_audio_packet, headset->got_initial_volume);
 
-		/* start work handling pcm config and audio timer */
-		schedule_work(&headset->work_register);
+		/* Register PCM and transport only once; resume reuses both. */
+		if (!READ_ONCE(headset->audio_initialized))
+			schedule_work(&headset->work_register);
 		return HRTIMER_NORESTART;
 	}
 
@@ -282,6 +320,9 @@ static enum hrtimer_restart gip_headset_start_audio(struct hrtimer *timer)
 	dev_dbg(&headset->client->dev, "%s: send device start, try %d/%d.\n",
 		__func__, headset->start_counter, GIP_HS_MAX_RETRIES);
 	err = gip_set_power_mode(headset->client, GIP_PWR_ON);
+	gip_headset_log_resume_event(headset,
+				     &headset->resume_power_on_count,
+				     10, "power-on-request", err);
 	if (err)
 		dev_err(&headset->client->dev,
 			"%s: set power mode failed: %d\n", __func__, err);
@@ -347,6 +388,32 @@ static void gip_headset_config(struct work_struct *work)
 			__func__, err);
 }
 
+static void gip_headset_reinitialize(struct work_struct *work)
+{
+	struct gip_headset *headset = container_of(to_delayed_work(work),
+							   typeof(*headset),
+							   work_reinitialize);
+	struct gip_client *client = headset->client;
+	struct gip_adapter *adap = client->adapter;
+	u8 id = client->id;
+	int err;
+
+	if (READ_ONCE(headset->suspended))
+		return;
+
+	dev_info(&client->dev,
+		 "PM resume: rebuilding GIP headset client after USB resume\n");
+	err = gip_reinitialize_client(client);
+	if (err)
+		dev_err(&adap->dev,
+			"PM resume: GIP headset client reinitialization failed: %d\n",
+			err);
+	else
+		dev_info(&adap->dev,
+			 "PM resume: fresh GIP identity request sent for client %u\n",
+			 id);
+}
+
 static void gip_headset_power_on(struct work_struct *work)
 {
 	struct gip_headset *headset = container_of(
@@ -394,6 +461,10 @@ static void gip_headset_register(struct work_struct *work)
 	struct gip_client *client = headset->client;
 	int err;
 
+	if (READ_ONCE(headset->suspended) ||
+	    READ_ONCE(headset->audio_initialized))
+		return;
+
 	headset->buffer = devm_kzalloc(&client->dev,
 				       client->audio_config_out.buffer_size,
 				       GFP_KERNEL);
@@ -434,6 +505,7 @@ static void gip_headset_register(struct work_struct *work)
 			__func__, err);
 		return;
 	}
+	WRITE_ONCE(headset->audio_initialized, true);
 
 	/* start audio timer */
 	hrtimer_start(&headset->timer, 0, HRTIMER_MODE_REL);
@@ -473,9 +545,21 @@ static int gip_headset_op_audio_ready(struct gip_client *client)
 {
 	struct gip_headset *headset = dev_get_drvdata(&client->dev);
 
+	if (READ_ONCE(headset->suspended))
+		return 0;
+
+	gip_headset_log_resume_event(headset,
+				     &headset->resume_audio_ready_count,
+				     10, "format-ready", client->audio_config_out.format);
+
 	dev_dbg(&client->dev,
 		"%s: audio ready : initialize start sequence.\n", __func__);
 	headset->start_counter = 0;
+	if (READ_ONCE(headset->audio_initialized)) {
+		dev_info(&client->dev,
+			 "PM resume: audio format confirmed; restarting playback timer\n");
+		hrtimer_start(&headset->timer, 0, HRTIMER_MODE_REL);
+	}
 	hrtimer_start(&headset->start_audio_timer, 0, HRTIMER_MODE_REL);
 	/* start auth handshake after GIP_HS_POWER_ON_DELAY */
 	schedule_delayed_work(&headset->work_power_on, GIP_HS_POWER_ON_DELAY);
@@ -490,6 +574,9 @@ static int gip_headset_op_audio_volume(struct gip_client *client,
 
 	/* headset reported initial volume, ready to start audio I/O */
 	headset->got_initial_volume = true;
+	gip_headset_log_resume_event(headset,
+				     &headset->resume_audio_volume_count,
+				     1, "volume-report", (in << 8) | out);
 
 	/* ignore hardware volume, let software handle volume changes */
 	return 0;
@@ -503,7 +590,13 @@ static int gip_headset_op_audio_samples(struct gip_client *client,
 	bool elapsed = false;
 	unsigned long flags;
 
+	if (READ_ONCE(headset->suspended))
+		return 0;
+
 	headset->got_audio_packet = true;
+		gip_headset_log_resume_event(headset,
+					     &headset->resume_audio_input_count,
+					     10000, "headset-samples", len);
 
 	if (!sub)
 		return 0;
@@ -541,7 +634,14 @@ static int gip_headset_probe(struct gip_client *client)
 
 	INIT_WORK(&headset->work_config, gip_headset_config);
 	INIT_DELAYED_WORK(&headset->work_power_on, gip_headset_power_on);
+	INIT_DELAYED_WORK(&headset->work_reinitialize,
+			  gip_headset_reinitialize);
 	INIT_WORK(&headset->work_register, gip_headset_register);
+	atomic_set(&headset->resume_audio_ready_count, 0);
+	atomic_set(&headset->resume_audio_volume_count, 0);
+	atomic_set(&headset->resume_audio_input_count, 0);
+	atomic_set(&headset->resume_audio_output_count, 0);
+	atomic_set(&headset->resume_power_on_count, 0);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
 	hrtimer_init(&headset->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -571,15 +671,76 @@ static void gip_headset_remove(struct gip_client *client)
 {
 	struct gip_headset *headset = dev_get_drvdata(&client->dev);
 
+	dev_info(&client->dev,
+		 "headset client remove: stopping audio work and disabling transport\n");
 	cancel_work_sync(&headset->work_config);
 	cancel_delayed_work_sync(&headset->work_power_on);
+	cancel_delayed_work_sync(&headset->work_reinitialize);
 	cancel_work_sync(&headset->work_register);
 	hrtimer_cancel(&headset->timer);
 	hrtimer_cancel(&headset->start_audio_timer);
 	gip_disable_audio(client);
 }
 
+static int gip_headset_suspend(struct device *dev)
+{
+	struct gip_headset *headset = dev_get_drvdata(dev);
+
+	if (!headset)
+		return 0;
+
+	WRITE_ONCE(headset->suspended, true);
+	WRITE_ONCE(headset->resume_tracking, false);
+	dev_info(dev, "PM suspend: stopping headset audio timers/work\n");
+	hrtimer_cancel(&headset->timer);
+	hrtimer_cancel(&headset->start_audio_timer);
+	cancel_work_sync(&headset->work_config);
+	cancel_delayed_work_sync(&headset->work_power_on);
+	cancel_delayed_work_sync(&headset->work_reinitialize);
+	cancel_work_sync(&headset->work_register);
+	return 0;
+}
+
+static int gip_headset_resume(struct device *dev)
+{
+	struct gip_headset *headset = dev_get_drvdata(dev);
+
+	if (!headset)
+		return 0;
+
+	atomic_set(&headset->resume_audio_ready_count, 0);
+	atomic_set(&headset->resume_audio_volume_count, 0);
+	atomic_set(&headset->resume_audio_input_count, 0);
+	atomic_set(&headset->resume_audio_output_count, 0);
+	atomic_set(&headset->resume_power_on_count, 0);
+	WRITE_ONCE(headset->resume_tracking, true);
+	WRITE_ONCE(headset->suspended, false);
+	dev_info(dev, "PM resume: headset audio diagnostics armed\n");
+	if (!READ_ONCE(headset->audio_initialized)) {
+		dev_info(dev, "PM resume: retrying initial audio setup\n");
+		schedule_work(&headset->work_config);
+		return 0;
+	}
+
+	headset->start_counter = 0;
+	headset->got_initial_volume = false;
+	headset->got_audio_packet = false;
+	dev_info(dev,
+		 "PM resume: scheduling delayed GIP client reset and fresh identification\n");
+	schedule_delayed_work(&headset->work_reinitialize,
+			      msecs_to_jiffies(1000));
+	return 0;
+}
+
+static const struct dev_pm_ops gip_headset_pm_ops = {
+	.suspend = gip_headset_suspend,
+	.resume = gip_headset_resume,
+};
+
 static struct gip_driver gip_headset_driver = {
+	.drv = {
+		.pm = &gip_headset_pm_ops,
+	},
 	.name = "xone-gip-headset",
 	.class = "Windows.Xbox.Input.Headset",
 	.ops = {
