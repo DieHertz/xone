@@ -32,11 +32,12 @@ struct gip_adapter_buffer {
 };
 
 struct gip_adapter_ops {
-	/* get/submit/key callbacks can run in atomic RX/timer context. */
+	/* Packet get/submit callbacks must be safe in atomic RX/timer context. */
 	int (*get_buffer)(struct gip_adapter *adap,
 			  struct gip_adapter_buffer *buf);
 	int (*submit_buffer)(struct gip_adapter *adap,
 			     struct gip_adapter_buffer *buf);
+	/* Key programming may sleep; authentication work calls this operation. */
 	int (*set_encryption_key)(struct gip_adapter *adap, u8 *key, int len);
 	int (*enable_audio)(struct gip_adapter *adap);
 	int (*init_audio_in)(struct gip_adapter *adap);

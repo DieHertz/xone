@@ -1609,6 +1609,7 @@ static int gip_handle_pkt_audio_samples(struct gip_client *client,
 {
 	struct gip_pkt_audio_samples *pkt = data;
 	struct gip_audio_config *out = &client->audio_config_out;
+	u16 flow_rate;
 	int err = 0;
 
 	if (len < sizeof(*pkt))
@@ -1617,9 +1618,15 @@ static int gip_handle_pkt_audio_samples(struct gip_client *client,
 	if (down_trylock(&client->drv_lock))
 		return -EBUSY;
 
-	out->flow_rate = le16_to_cpu(pkt->flow_rate);
-	if (out->flow_rate != out->buffer_size)
-		gip_dbg(client, "%s: Unusual flow rate control -> %u", __func__, out->flow_rate);
+	flow_rate = le16_to_cpu(pkt->flow_rate);
+	if (out->flow_rate != flow_rate) {
+		out->flow_rate = flow_rate;
+		/* Repeated per-packet reports must not flood suspend diagnostics. */
+		dev_dbg_ratelimited(&client->adapter->dev,
+			"%s: client %u audio flow report changed: %u (block=%u fragment=%u)\n",
+			__func__, client->id, flow_rate,
+			out->buffer_size, out->fragment_size);
+	}
 
 	if (client->drv && client->drv->ops.audio_samples)
 		err = client->drv->ops.audio_samples(client, pkt->samples,
