@@ -50,6 +50,8 @@ struct gip_headset {
 	struct gip_client *client;
 	struct kref refcount;
 	struct snd_card *card;
+	struct gip_audio_config audio_config_in;
+	struct gip_audio_config audio_config_out;
 	struct gip_battery battery;
 	struct gip_auth auth;
 
@@ -129,9 +131,9 @@ static int gip_headset_pcm_open(struct snd_pcm_substream *sub)
 	struct snd_pcm_hardware hw = gip_headset_pcm_hw;
 
 	if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		cfg = &headset->client->audio_config_out;
+		cfg = &headset->audio_config_out;
 	else
-		cfg = &headset->client->audio_config_in;
+		cfg = &headset->audio_config_in;
 
 	hw.rate_min = cfg->sample_rate;
 	hw.rate_max = cfg->sample_rate;
@@ -184,7 +186,7 @@ static int gip_headset_pcm_trigger(struct snd_pcm_substream *sub, int cmd)
 
 	if (!stream->substream && sub->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		memset(headset->buffer, 0,
-		       headset->client->audio_config_out.buffer_size);
+		       headset->audio_config_out.buffer_size);
 
 	return 0;
 }
@@ -533,8 +535,11 @@ static void gip_headset_register(struct work_struct *work)
 
 	/* Failed/partial registration is rebuilt on a fresh GIP client. */
 	WRITE_ONCE(headset->registration_started, true);
+	/* Rebinding this client must not change an old card's PCM parameters. */
+	headset->audio_config_in = client->audio_config_in;
+	headset->audio_config_out = client->audio_config_out;
 
-	headset->buffer = kzalloc(client->audio_config_out.buffer_size,
+	headset->buffer = kzalloc(headset->audio_config_out.buffer_size,
 				  GFP_KERNEL);
 	if (!headset->buffer)
 		return;
@@ -772,7 +777,7 @@ static void gip_headset_remove(struct gip_client *client)
 	card = headset->card;
 	headset->card = NULL;
 	dev_set_drvdata(&client->dev, NULL);
-	/* Old PCM callbacks retain the headset, buffer and inline client config. */
+	/* Old PCM callbacks retain the headset, buffer and their config snapshots. */
 	snd_card_free_when_closed(card);
 	gip_headset_put(headset);
 }
