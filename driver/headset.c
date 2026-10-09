@@ -334,7 +334,7 @@ static enum hrtimer_restart gip_headset_start_audio(struct hrtimer *timer)
 			__func__, headset->start_counter, GIP_HS_MAX_RETRIES,
 			headset->got_audio_packet, headset->got_initial_volume);
 
-		/* Register PCM and transport only once; resume reuses both. */
+		/* Register PCM and transport only once for this client. */
 		if (!READ_ONCE(headset->audio_initialized))
 			schedule_work(&headset->work_register);
 		return HRTIMER_NORESTART;
@@ -698,12 +698,16 @@ static void gip_headset_remove(struct gip_client *client)
 
 	dev_info(&client->dev,
 		 "headset client remove: stopping audio work and disabling transport\n");
+	WRITE_ONCE(headset->suspended, true);
+	WRITE_ONCE(headset->resume_tracking, false);
+	/* Stop the producer before draining the work it can enqueue. */
+	hrtimer_cancel(&headset->start_audio_timer);
 	cancel_work_sync(&headset->work_config);
 	cancel_delayed_work_sync(&headset->work_power_on);
 	cancel_delayed_work_sync(&headset->work_reinitialize);
 	cancel_work_sync(&headset->work_register);
+	/* A registration already in progress may have started this timer. */
 	hrtimer_cancel(&headset->timer);
-	hrtimer_cancel(&headset->start_audio_timer);
 	gip_disable_audio(client);
 }
 
@@ -714,15 +718,25 @@ static int gip_headset_suspend(struct device *dev)
 	if (!headset)
 		return 0;
 
+	/*
+	 * RX invokes audio_ready under drv_lock. Its suspended check and timer
+	 * starts must finish before we cancel timers, otherwise a callback that
+	 * observed the old gate can rearm them after cancellation. Drop the
+	 * semaphore before draining work: client removal also acquires it.
+	 * remove() already runs under this semaphore and must not retake it.
+	 */
+	down(&headset->client->drv_lock);
 	WRITE_ONCE(headset->suspended, true);
 	WRITE_ONCE(headset->resume_tracking, false);
+	up(&headset->client->drv_lock);
 	dev_info(dev, "PM suspend: stopping headset audio timers/work\n");
-	hrtimer_cancel(&headset->timer);
+	/* start_audio queues registration, which can start the playback timer. */
 	hrtimer_cancel(&headset->start_audio_timer);
 	cancel_work_sync(&headset->work_config);
 	cancel_delayed_work_sync(&headset->work_power_on);
 	cancel_delayed_work_sync(&headset->work_reinitialize);
 	cancel_work_sync(&headset->work_register);
+	hrtimer_cancel(&headset->timer);
 	return 0;
 }
 
@@ -733,6 +747,8 @@ static int gip_headset_resume(struct device *dev)
 	if (!headset)
 		return 0;
 
+	/* Publish the entire new startup state before RX can run audio_ready. */
+	down(&headset->client->drv_lock);
 	atomic_set(&headset->resume_audio_ready_count, 0);
 	atomic_set(&headset->resume_audio_volume_count, 0);
 	atomic_set(&headset->resume_audio_input_count, 0);
@@ -741,11 +757,13 @@ static int gip_headset_resume(struct device *dev)
 	WRITE_ONCE(headset->resume_tracking, true);
 	WRITE_ONCE(headset->suspended, false);
 	dev_info(dev, "PM resume: headset audio diagnostics armed\n");
-	if (!READ_ONCE(headset->audio_initialized)) {
-		dev_info(dev, "PM resume: retrying initial audio setup\n");
-		schedule_work(&headset->work_config);
-		return 0;
-	}
+	/*
+	 * A failed initial registration may already own a PCM card or part of
+	 * the transport URB pool. Retrying configuration on that same client
+	 * would repeat those allocations. Rebuild incomplete clients too, so
+	 * removal releases their managed resources and disables audio before
+	 * the replacement is probed. Keep USB interface changes out of PM.
+	 */
 
 	headset->start_counter = 0;
 	headset->got_initial_volume = false;
@@ -754,6 +772,7 @@ static int gip_headset_resume(struct device *dev)
 		 "PM resume: scheduling delayed GIP client reset and fresh identification\n");
 	schedule_delayed_work(&headset->work_reinitialize,
 			      msecs_to_jiffies(1000));
+	up(&headset->client->drv_lock);
 	return 0;
 }
 
