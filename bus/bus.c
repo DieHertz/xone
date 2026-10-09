@@ -105,6 +105,8 @@ static void gip_bus_remove(struct device *dev)
 
 	drv = client->drv;
 	if (drv) {
+		dev_info(dev, "GIP client %u unbinding driver %s\n",
+			 client->id, drv->name);
 		client->drv = NULL;
 		if (drv->remove)
 			drv->remove(client);
@@ -150,6 +152,7 @@ struct gip_adapter *gip_create_adapter(struct device *parent,
 	adap->audio_packet_count = audio_pkts;
 	dev_set_name(&adap->dev, "gip%d", adap->id);
 	spin_lock_init(&adap->send_lock);
+	spin_lock_init(&adap->clients_lock);
 
 	err = device_register(&adap->dev);
 	if (err)
@@ -174,30 +177,50 @@ EXPORT_SYMBOL_GPL(gip_create_adapter);
 
 int gip_power_off_adapter(struct gip_adapter *adap)
 {
-	struct gip_client *client = adap->clients[0];
+	struct gip_client *client;
+	unsigned long flags;
+	int err = 0;
 
-	if (!client)
-		return 0;
+	spin_lock_irqsave(&adap->clients_lock, flags);
+	client = adap->clients[0];
+	if (!adap->shutting_down && client)
+		/* Atomic transport send; no USB control requests here. */
+		err = gip_set_power_mode(client, GIP_PWR_OFF);
+	spin_unlock_irqrestore(&adap->clients_lock, flags);
 
-	/* power off main client */
-	return gip_set_power_mode(client, GIP_PWR_OFF);
+	return err;
 }
 EXPORT_SYMBOL_GPL(gip_power_off_adapter);
 
 void gip_destroy_adapter(struct gip_adapter *adap)
 {
+	struct gip_client *clients[GIP_MAX_CLIENTS];
 	struct gip_client *client;
+	unsigned long flags;
 	int i;
+
+	/* Transport must have stopped RX before destroying the adapter. */
+	spin_lock_irqsave(&adap->clients_lock, flags);
+	adap->shutting_down = true;
+	for (i = 0; i < GIP_MAX_CLIENTS; i++) {
+		clients[i] = adap->clients[i];
+		adap->clients[i] = NULL;
+	}
+	spin_unlock_irqrestore(&adap->clients_lock, flags);
 
 	/* ensure all state changes have been processed */
 	flush_workqueue(adap->clients_wq);
 
 	for (i = GIP_MAX_CLIENTS - 1; i >= 0; i--) {
-		client = adap->clients[i];
-		if (!client || !device_is_registered(&client->dev))
+		client = clients[i];
+		if (!client)
 			continue;
 
-		device_unregister(&client->dev);
+		if (device_is_registered(&client->dev))
+			device_unregister(&client->dev);
+		else
+			/* Includes fresh clients still waiting for IDENTIFY. */
+			put_device(&client->dev);
 	}
 
 	ida_free(&gip_adapter_ida, adap->id);
@@ -226,13 +249,9 @@ static void gip_register_client(struct work_struct *work)
 	 */
 	msleep(700);
 
-	client->dev.parent = &client->adapter->dev;
-	client->dev.type = &gip_client_type;
-	client->dev.bus = &gip_bus_type;
-	sema_init(&client->drv_lock, 1);
 	dev_set_name(&client->dev, "gip%d.%u", client->adapter->id, client->id);
 
-	err = device_register(&client->dev);
+	err = device_add(&client->dev);
 	if (err)
 		dev_err(&client->dev, "%s: register failed: %d\n",
 			__func__, err);
@@ -244,17 +263,29 @@ static void gip_unregister_client(struct work_struct *work)
 {
 	struct gip_client *client = container_of(work, typeof(*client),
 						 work_unregister);
+	struct gip_adapter *adap = client->adapter;
+	unsigned long flags;
 
-	if (!device_is_registered(&client->dev))
-		return;
+	/* Wait for the parser/reset which retired this client to finish. */
+	spin_lock_irqsave(&adap->clients_lock, flags);
+	spin_unlock_irqrestore(&adap->clients_lock, flags);
 
 	dev_dbg(&client->dev, "%s: unregistered\n", __func__);
-	device_unregister(&client->dev);
+	if (device_is_registered(&client->dev))
+		device_unregister(&client->dev);
+	else
+		put_device(&client->dev);
 }
 
-struct gip_client *gip_get_client(struct gip_adapter *adap, u8 id)
+struct gip_client *gip_get_client_locked(struct gip_adapter *adap, u8 id)
 {
 	struct gip_client *client;
+
+	lockdep_assert_held(&adap->clients_lock);
+	if (adap->shutting_down)
+		return ERR_PTR(-ESHUTDOWN);
+	if (id >= GIP_MAX_CLIENTS)
+		return ERR_PTR(-EINVAL);
 
 	client = adap->clients[id];
 	if (client)
@@ -266,6 +297,11 @@ struct gip_client *gip_get_client(struct gip_adapter *adap, u8 id)
 
 	client->id = id;
 	client->adapter = adap;
+	client->dev.parent = &adap->dev;
+	client->dev.type = &gip_client_type;
+	client->dev.bus = &gip_bus_type;
+	/* The slot owns this reference even before device_add(). */
+	device_initialize(&client->dev);
 	sema_init(&client->drv_lock, 1);
 	INIT_WORK(&client->work_register, gip_register_client);
 	INIT_WORK(&client->work_unregister, gip_unregister_client);
@@ -278,14 +314,25 @@ struct gip_client *gip_get_client(struct gip_adapter *adap, u8 id)
 	return client;
 }
 
-void gip_add_client(struct gip_client *client)
+void gip_add_client_locked(struct gip_client *client)
 {
+	lockdep_assert_held(&client->adapter->clients_lock);
+	if (client->adapter->shutting_down)
+		return;
 	queue_work(client->adapter->clients_wq, &client->work_register);
 }
 
-void gip_remove_client(struct gip_client *client)
+void gip_remove_client_locked(struct gip_client *client)
 {
-	client->adapter->clients[client->id] = NULL;
+	struct gip_adapter *adap = client->adapter;
+
+	lockdep_assert_held(&adap->clients_lock);
+	if (adap->clients[client->id] != client)
+		return;
+	dev_info(&client->adapter->dev,
+		 "GIP client %u removal requested; queueing unregister\n",
+		 client->id);
+	adap->clients[client->id] = NULL;
 	queue_work(client->adapter->clients_wq, &client->work_unregister);
 }
 

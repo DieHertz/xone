@@ -187,8 +187,11 @@ static int xone_dongle_get_buffer(struct gip_adapter *adap,
 		return -ENOSPC;
 
 	skb = xone_mt76_alloc_message(XONE_DONGLE_LEN_CMD_PKT, GFP_ATOMIC);
-	if (!skb)
+	if (!skb) {
+		usb_anchor_urb(urb, &client->dongle->urbs_out_idle);
+		usb_free_urb(urb);
 		return -ENOMEM;
+	}
 
 	/* command header + WCID data + TXWI + QoS header + padding */
 	/* see xone_dongle_prep_packet and xone_mt76_prep_message */
@@ -212,32 +215,41 @@ static int xone_dongle_submit_buffer(struct gip_adapter *adap,
 	struct xone_dongle_client *client = dev_get_drvdata(&adap->dev);
 	struct xone_dongle_skb_cb *cb;
 	struct sk_buff *skb = buf->context;
+	struct urb *urb;
 	int err;
 
+	cb = (struct xone_dongle_skb_cb *)skb->cb;
+	urb = cb->urb;
 	skb_put(skb, buf->length);
 
 	if (buf->type == GIP_BUF_DATA)
 		xone_dongle_prep_packet(client, skb, XONE_DONGLE_QUEUE_DATA);
 	else if (buf->type == GIP_BUF_AUDIO)
 		xone_dongle_prep_packet(client, skb, XONE_DONGLE_QUEUE_AUDIO);
-	else
-		return -EINVAL;
-
-	cb = (struct xone_dongle_skb_cb *)skb->cb;
-	cb->urb->context = skb;
-	cb->urb->transfer_buffer = skb->data;
-	cb->urb->transfer_buffer_length = skb->len;
-	usb_anchor_urb(cb->urb, &client->dongle->urbs_out_busy);
-
-	err = usb_submit_urb(cb->urb, GFP_ATOMIC);
-	if (err) {
-		usb_unanchor_urb(cb->urb);
-		usb_anchor_urb(cb->urb, &client->dongle->urbs_out_idle);
-		dev_kfree_skb_any(skb);
+	else {
+		err = -EINVAL;
+		goto return_buffer;
 	}
 
-	usb_free_urb(cb->urb);
+	urb->context = skb;
+	urb->transfer_buffer = skb->data;
+	urb->transfer_buffer_length = skb->len;
+	usb_anchor_urb(urb, &client->dongle->urbs_out_busy);
 
+	err = usb_submit_urb(urb, GFP_ATOMIC);
+	if (err) {
+		usb_unanchor_urb(urb);
+		goto return_buffer;
+	}
+
+	/* Completion may already have freed skb (and cb) on another CPU. */
+	usb_free_urb(urb);
+	return 0;
+
+return_buffer:
+	usb_anchor_urb(urb, &client->dongle->urbs_out_idle);
+	dev_kfree_skb_any(skb);
+	usb_free_urb(urb);
 	return err;
 }
 

@@ -4,6 +4,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
 
@@ -30,6 +31,10 @@
 
 struct xone_wired {
 	struct usb_device *udev;
+	struct mutex pm_lock;
+	spinlock_t io_lock;
+	bool suspended;
+	bool audio_in_active;
 
 	struct xone_wired_port {
 		struct device *dev;
@@ -77,6 +82,8 @@ static void xone_wired_complete_data_in(struct urb *urb)
 
 resubmit:
 	/* can fail during USB device removal */
+	if (READ_ONCE(wired->suspended))
+		return;
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err)
 		dev_dbg(dev, "%s: submit failed: %d\n", __func__, err);
@@ -89,17 +96,34 @@ static void xone_wired_complete_audio_in(struct urb *urb)
 	struct usb_iso_packet_descriptor *desc;
 	int i, err;
 
-	if (urb->status)
-		return;
+	if (urb->status) {
+		/* Recover from transient controller errors after system resume. */
+		dev_dbg_ratelimited(dev, "%s: completion status: %d\n",
+				    __func__, urb->status);
+		switch (urb->status) {
+		case -ENOENT:
+		case -ECONNRESET:
+		case -ESHUTDOWN:
+			return;
+		default:
+			goto resubmit;
+		}
+	}
 
 	for (i = 0; i < urb->number_of_packets; i++) {
 		desc = &urb->iso_frame_desc[i];
 
 		/* device reset after system sleep can cause xHCI errors */
 		if (desc->status == -EPROTO) {
-			dev_warn_once(dev, "%s: protocol error\n", __func__);
+			dev_warn_ratelimited(dev,
+				"%s: packet %d protocol error (%d); skipping remaining packets\n",
+				__func__, i, desc->status);
 			break;
 		}
+		if (desc->status)
+			dev_dbg_ratelimited(dev,
+				"%s: packet %d completion status: %d\n",
+				__func__, i, desc->status);
 
 		if (!desc->actual_length)
 			continue;
@@ -111,7 +135,10 @@ static void xone_wired_complete_audio_in(struct urb *urb)
 			dev_err(dev, "%s: process failed: %d\n", __func__, err);
 	}
 
-	/* can fail during USB device removal */
+resubmit:
+	/* can fail during USB device removal or while the interface is suspended */
+	if (READ_ONCE(wired->suspended))
+		return;
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err)
 		dev_dbg(dev, "%s: submit failed: %d\n", __func__, err);
@@ -120,6 +147,11 @@ static void xone_wired_complete_audio_in(struct urb *urb)
 static void xone_wired_complete_out(struct urb *urb)
 {
 	struct xone_wired_port *port = urb->context;
+
+	if (urb->status && urb->status != -ENOENT &&
+	    urb->status != -ECONNRESET && urb->status != -ESHUTDOWN)
+		dev_dbg_ratelimited(port->dev,
+			"%s: completion status: %d\n", __func__, urb->status);
 
 	usb_anchor_urb(urb, &port->urbs_out_idle);
 }
@@ -191,15 +223,17 @@ static void xone_wired_free_urbs(struct xone_wired_port *port)
 	struct urb *urb = port->urb_in;
 
 	if (urb) {
-		usb_free_coherent(urb->dev, urb->transfer_buffer_length,
-				  urb->transfer_buffer, urb->transfer_dma);
+		if (urb->transfer_buffer)
+			usb_free_coherent(urb->dev, urb->transfer_buffer_length,
+					  urb->transfer_buffer, urb->transfer_dma);
 		usb_free_urb(urb);
 		port->urb_in = NULL;
 	}
 
 	while ((urb = usb_get_from_anchor(&port->urbs_out_idle))) {
-		usb_free_coherent(urb->dev, port->buffer_length_out,
-				  urb->transfer_buffer, urb->transfer_dma);
+		if (urb->transfer_buffer)
+			usb_free_coherent(urb->dev, port->buffer_length_out,
+					  urb->transfer_buffer, urb->transfer_dma);
 		usb_free_urb(urb);
 	}
 }
@@ -210,6 +244,8 @@ static int xone_wired_get_buffer(struct gip_adapter *adap,
 	struct xone_wired *wired = dev_get_drvdata(&adap->dev);
 	struct xone_wired_port *port;
 	struct urb *urb;
+	unsigned long flags;
+	int err = 0;
 
 	if (buf->type == GIP_BUF_DATA)
 		port = &wired->data_port;
@@ -218,15 +254,34 @@ static int xone_wired_get_buffer(struct gip_adapter *adap,
 	else
 		return -EINVAL;
 
+	spin_lock_irqsave(&wired->io_lock, flags);
+	if (wired->suspended) {
+		dev_dbg_ratelimited(port->dev,
+				    "output buffer unavailable: transport suspended (type=%u)\n",
+				    buf->type);
+		/* Keep the headset's hrtimer retrying while transport is paused. */
+		err = -ENOSPC;
+		goto unlock;
+	}
+
 	urb = usb_get_from_anchor(&port->urbs_out_idle);
-	if (!urb)
-		return -ENOSPC;
+	if (!urb) {
+		dev_err_ratelimited(port->dev,
+			"audio buffer pool empty (type=%u, audio_idle_empty=%d, data_idle_empty=%d)\n",
+			buf->type,
+			usb_anchor_empty(&wired->audio_port.urbs_out_idle),
+			usb_anchor_empty(&wired->data_port.urbs_out_idle));
+		err = -ENOSPC;
+		goto unlock;
+	}
 
 	buf->context = urb;
 	buf->data = urb->transfer_buffer;
 	buf->length = port->buffer_length_out;
 
-	return 0;
+	unlock:
+	spin_unlock_irqrestore(&wired->io_lock, flags);
+	return err;
 }
 
 static int xone_wired_submit_buffer(struct gip_adapter *adap,
@@ -235,6 +290,7 @@ static int xone_wired_submit_buffer(struct gip_adapter *adap,
 	struct xone_wired *wired = dev_get_drvdata(&adap->dev);
 	struct xone_wired_port *port;
 	struct urb *urb = buf->context;
+	unsigned long flags;
 	int err;
 
 	if (buf->type == GIP_BUF_DATA)
@@ -244,14 +300,21 @@ static int xone_wired_submit_buffer(struct gip_adapter *adap,
 	else
 		return -EINVAL;
 
-	urb->transfer_buffer_length = buf->length;
-	usb_anchor_urb(urb, &port->urbs_out_busy);
-
-	err = usb_submit_urb(urb, GFP_ATOMIC);
-	if (err) {
-		usb_unanchor_urb(urb);
+	spin_lock_irqsave(&wired->io_lock, flags);
+	if (wired->suspended) {
 		usb_anchor_urb(urb, &port->urbs_out_idle);
+		err = -ENOSPC;
+	} else {
+		urb->transfer_buffer_length = buf->length;
+		usb_anchor_urb(urb, &port->urbs_out_busy);
+
+		err = usb_submit_urb(urb, GFP_ATOMIC);
+		if (err) {
+			usb_unanchor_urb(urb);
+			usb_anchor_urb(urb, &port->urbs_out_idle);
+		}
 	}
+	spin_unlock_irqrestore(&wired->io_lock, flags);
 
 	usb_free_urb(urb);
 
@@ -262,15 +325,27 @@ static int xone_wired_enable_audio(struct gip_adapter *adap)
 {
 	struct xone_wired *wired = dev_get_drvdata(&adap->dev);
 	struct usb_interface *intf;
+	int err;
 
 	if (!wired->audio_port.dev)
 		return -ENOTSUPP;
 
-	intf = to_usb_interface(wired->audio_port.dev);
-	if (intf->cur_altsetting->desc.bAlternateSetting == 1)
-		return -EALREADY;
+	mutex_lock(&wired->pm_lock);
+	if (READ_ONCE(wired->suspended)) {
+		err = -EHOSTDOWN;
+		goto unlock;
+	}
 
-	return usb_set_interface(wired->udev, XONE_WIRED_INTF_AUDIO, 1);
+	intf = to_usb_interface(wired->audio_port.dev);
+	if (intf->cur_altsetting->desc.bAlternateSetting == 1) {
+		err = -EALREADY;
+		goto unlock;
+	}
+
+	err = usb_set_interface(wired->udev, XONE_WIRED_INTF_AUDIO, 1);
+unlock:
+	mutex_unlock(&wired->pm_lock);
+	return err;
 }
 
 static int xone_wired_init_audio_in(struct gip_adapter *adap)
@@ -279,22 +354,39 @@ static int xone_wired_init_audio_in(struct gip_adapter *adap)
 	struct xone_wired_port *port = &wired->audio_port;
 	struct urb *urb;
 	void *buf;
-	int len, i;
+	int len, i, err;
 
-	if (!port->ep_in)
-		return -ENOTSUPP;
+	mutex_lock(&wired->pm_lock);
+	if (READ_ONCE(wired->suspended)) {
+		err = -EHOSTDOWN;
+		goto unlock;
+	}
+	if (!port->ep_in) {
+		err = -ENOTSUPP;
+		goto unlock;
+	}
+	if (port->urb_in) {
+		err = -EALREADY;
+		goto unlock;
+	}
 
 	urb = usb_alloc_urb(XONE_WIRED_NUM_AUDIO_PKTS, GFP_KERNEL);
-	if (!urb)
-		return -ENOMEM;
+	if (!urb) {
+		err = -ENOMEM;
+		goto unlock;
+	}
 
 	port->urb_in = urb;
 
 	len = usb_endpoint_maxp(port->ep_in);
 	buf = usb_alloc_coherent(wired->udev, len * XONE_WIRED_NUM_AUDIO_PKTS,
 				 GFP_KERNEL, &urb->transfer_dma);
-	if (!buf)
-		return -ENOMEM;
+	if (!buf) {
+		port->urb_in = NULL;
+		usb_free_urb(urb);
+		err = -ENOMEM;
+		goto unlock;
+	}
 
 	urb->dev = wired->udev;
 	urb->pipe = usb_rcvisocpipe(wired->udev, port->ep_in->bEndpointAddress);
@@ -311,7 +403,19 @@ static int xone_wired_init_audio_in(struct gip_adapter *adap)
 		urb->iso_frame_desc[i].length = len;
 	}
 
-	return usb_submit_urb(urb, GFP_KERNEL);
+	err = usb_submit_urb(urb, GFP_KERNEL);
+	if (err) {
+		port->urb_in = NULL;
+		usb_free_coherent(wired->udev, urb->transfer_buffer_length,
+				  urb->transfer_buffer, urb->transfer_dma);
+		usb_free_urb(urb);
+	} else {
+		wired->audio_in_active = true;
+	}
+
+unlock:
+	mutex_unlock(&wired->pm_lock);
+	return err;
 }
 
 static int xone_wired_init_audio_out(struct gip_adapter *adap, int pkt_len)
@@ -322,23 +426,34 @@ static int xone_wired_init_audio_out(struct gip_adapter *adap, int pkt_len)
 	void *buf;
 	int i, j;
 
-	if (!port->ep_out)
-		return -ENOTSUPP;
+	mutex_lock(&wired->pm_lock);
+	if (READ_ONCE(wired->suspended)) {
+		i = -EHOSTDOWN;
+		goto unlock;
+	}
+	if (!port->ep_out) {
+		i = -ENOTSUPP;
+		goto unlock;
+	}
 
 	port->buffer_length_out = pkt_len * XONE_WIRED_NUM_AUDIO_PKTS;
 
 	for (i = 0; i < XONE_WIRED_NUM_AUDIO_URBS; i++) {
 		urb = usb_alloc_urb(XONE_WIRED_NUM_AUDIO_PKTS, GFP_KERNEL);
-		if (!urb)
-			return -ENOMEM;
+		if (!urb) {
+			i = -ENOMEM;
+			goto unlock;
+		}
 
 		usb_anchor_urb(urb, &port->urbs_out_idle);
 		usb_free_urb(urb);
 
 		buf = usb_alloc_coherent(wired->udev, port->buffer_length_out,
 					 GFP_KERNEL, &urb->transfer_dma);
-		if (!buf)
-			return -ENOMEM;
+		if (!buf) {
+			i = -ENOMEM;
+			goto unlock;
+		}
 
 		urb->dev = wired->udev;
 		urb->pipe = usb_sndisocpipe(wired->udev,
@@ -357,7 +472,10 @@ static int xone_wired_init_audio_out(struct gip_adapter *adap, int pkt_len)
 		}
 	}
 
-	return 0;
+	i = 0;
+unlock:
+	mutex_unlock(&wired->pm_lock);
+	return i;
 }
 
 static int xone_wired_disable_audio(struct gip_adapter *adap)
@@ -365,19 +483,39 @@ static int xone_wired_disable_audio(struct gip_adapter *adap)
 	struct xone_wired *wired = dev_get_drvdata(&adap->dev);
 	struct xone_wired_port *port = &wired->audio_port;
 	struct usb_interface *intf;
+	int err;
 
-	if (!port->dev)
-		return -ENOTSUPP;
+	dev_info(&adap->dev, "disable audio requested (suspended=%d)\n",
+		 READ_ONCE(wired->suspended));
+	mutex_lock(&wired->pm_lock);
+	dev_info(&adap->dev, "disable audio acquired PM lock\n");
+	if (!port->dev) {
+		err = -ENOTSUPP;
+		goto unlock;
+	}
 
 	intf = to_usb_interface(port->dev);
-	if (!intf->cur_altsetting->desc.bAlternateSetting)
-		return -EALREADY;
+	if (!intf->cur_altsetting->desc.bAlternateSetting) {
+		err = -EALREADY;
+		goto unlock;
+	}
 
-	usb_kill_urb(port->urb_in);
+	wired->audio_in_active = false;
+	if (port->urb_in)
+		usb_kill_urb(port->urb_in);
 	usb_kill_anchored_urbs(&port->urbs_out_busy);
 	xone_wired_free_urbs(port);
 
-	return usb_set_interface(wired->udev, XONE_WIRED_INTF_AUDIO, 0);
+	dev_info(&adap->dev, "disable audio: selecting alternate setting 0\n");
+	err = usb_set_interface(wired->udev, XONE_WIRED_INTF_AUDIO, 0);
+	if (err)
+		dev_err(&adap->dev, "disable audio: alternate setting failed: %d\n",
+			err);
+	else
+		dev_info(&adap->dev, "disable audio complete\n");
+unlock:
+	mutex_unlock(&wired->pm_lock);
+	return err;
 }
 
 static struct gip_adapter_ops xone_wired_adapter_ops = {
@@ -390,6 +528,38 @@ static struct gip_adapter_ops xone_wired_adapter_ops = {
 };
 
 static struct usb_driver xone_wired_driver;
+
+static int xone_wired_create_adapter(struct xone_wired *wired,
+				     struct device *parent)
+{
+	struct gip_adapter *adapter;
+
+	if (wired->adapter)
+		return -EALREADY;
+
+	adapter = gip_create_adapter(parent, &xone_wired_adapter_ops,
+				     XONE_WIRED_NUM_AUDIO_PKTS);
+	if (IS_ERR(adapter))
+		return PTR_ERR(adapter);
+
+	wired->adapter = adapter;
+	dev_set_drvdata(&adapter->dev, wired);
+
+	return 0;
+}
+
+static void xone_wired_destroy_adapter(struct xone_wired *wired)
+{
+	struct gip_adapter *adapter = wired->adapter;
+
+	if (!adapter)
+		return;
+
+	/* Stop any completion path from accessing the adapter being removed. */
+	wired->adapter = NULL;
+	gip_destroy_adapter(adapter);
+	WRITE_ONCE(wired->audio_in_active, false);
+}
 
 static int xone_wired_find_isoc_endpoints(struct usb_host_interface *alt,
 					  struct usb_endpoint_descriptor **in,
@@ -481,6 +651,8 @@ static int xone_wired_probe(struct usb_interface *intf,
 		return -ENOMEM;
 
 	wired->udev = interface_to_usbdev(intf);
+	mutex_init(&wired->pm_lock);
+	spin_lock_init(&wired->io_lock);
 
 	/* newer devices require a reset after system sleep */
 	usb_reset_device(wired->udev);
@@ -493,12 +665,9 @@ static int xone_wired_probe(struct usb_interface *intf,
 	if (err)
 		return err;
 
-	wired->adapter = gip_create_adapter(&intf->dev, &xone_wired_adapter_ops,
-					    XONE_WIRED_NUM_AUDIO_PKTS);
-	if (IS_ERR(wired->adapter))
-		return PTR_ERR(wired->adapter);
-
-	dev_set_drvdata(&wired->adapter->dev, wired);
+	err = xone_wired_create_adapter(wired, &intf->dev);
+	if (err)
+		return err;
 
 	err = xone_wired_init_data_out(wired);
 	if (err)
@@ -517,7 +686,7 @@ static int xone_wired_probe(struct usb_interface *intf,
 
 err_free_urbs:
 	xone_wired_free_urbs(&wired->data_port);
-	gip_destroy_adapter(wired->adapter);
+	xone_wired_destroy_adapter(wired);
 
 	return err;
 }
@@ -534,12 +703,137 @@ static void xone_wired_disconnect(struct usb_interface *intf)
 	usb_kill_urb(wired->audio_port.urb_in);
 
 	/* also disables the audio interface */
-	gip_destroy_adapter(wired->adapter);
+	xone_wired_destroy_adapter(wired);
 
 	usb_kill_anchored_urbs(&wired->data_port.urbs_out_busy);
 	xone_wired_free_urbs(&wired->data_port);
 
 	usb_set_intfdata(intf, NULL);
+}
+
+static int xone_wired_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct xone_wired *wired = usb_get_intfdata(intf);
+	unsigned long flags;
+
+	/* The audio interface is claimed separately with no interface data. */
+	if (!wired)
+		return 0;
+
+	dev_info(&intf->dev, "PM suspend: begin (auto=%d)\n",
+		 PMSG_IS_AUTO(message));
+
+	mutex_lock(&wired->pm_lock);
+	spin_lock_irqsave(&wired->io_lock, flags);
+	wired->suspended = true;
+	spin_unlock_irqrestore(&wired->io_lock, flags);
+
+	dev_info(&intf->dev, "PM suspend: stopping data input URB\n");
+	usb_kill_urb(wired->data_port.urb_in);
+	if (wired->audio_port.urb_in) {
+		dev_info(&intf->dev, "PM suspend: stopping audio input URB\n");
+		usb_kill_urb(wired->audio_port.urb_in);
+	}
+	dev_info(&intf->dev, "PM suspend: stopping busy output URBs\n");
+	usb_kill_anchored_urbs(&wired->data_port.urbs_out_busy);
+	usb_kill_anchored_urbs(&wired->audio_port.urbs_out_busy);
+	mutex_unlock(&wired->pm_lock);
+
+	dev_info(&intf->dev, "PM suspend: USB transfers quiesced\n");
+	dev_info(&intf->dev,
+		 "PM suspend: pools data_idle_empty=%d data_busy_empty=%d audio_idle_empty=%d audio_busy_empty=%d\n",
+		 usb_anchor_empty(&wired->data_port.urbs_out_idle),
+		 usb_anchor_empty(&wired->data_port.urbs_out_busy),
+		 usb_anchor_empty(&wired->audio_port.urbs_out_idle),
+		 usb_anchor_empty(&wired->audio_port.urbs_out_busy));
+	return 0;
+}
+
+static int xone_wired_resume_common(struct usb_interface *intf, bool reset)
+{
+	struct xone_wired *wired = usb_get_intfdata(intf);
+	struct usb_interface *audio_intf;
+	unsigned long flags;
+	bool audio_active;
+	int err;
+
+	/* The audio interface is claimed separately with no interface data. */
+	if (!wired)
+		return 0;
+
+	dev_info(&intf->dev, "PM %s: begin\n",
+		 reset ? "reset_resume" : "resume");
+
+	mutex_lock(&wired->pm_lock);
+	audio_active = wired->audio_in_active;
+	if (audio_active) {
+		audio_intf = usb_ifnum_to_if(wired->udev,
+					     XONE_WIRED_INTF_AUDIO);
+		if (!audio_intf) {
+			err = -ENODEV;
+			goto unlock;
+		}
+
+		/* A reset may have cleared the device's audio alternate setting. */
+		if (reset ||
+		    audio_intf->cur_altsetting->desc.bAlternateSetting != 1) {
+			dev_info(&intf->dev,
+				 "PM resume: restoring audio alternate setting\n");
+			err = usb_set_interface(wired->udev,
+					       XONE_WIRED_INTF_AUDIO, 1);
+			if (err)
+				goto unlock;
+		}
+	}
+
+	spin_lock_irqsave(&wired->io_lock, flags);
+	wired->suspended = false;
+	spin_unlock_irqrestore(&wired->io_lock, flags);
+
+	err = usb_submit_urb(wired->data_port.urb_in, GFP_KERNEL);
+	if (err)
+		goto err_suspend;
+	dev_info(&intf->dev, "PM resume: data input URB restarted\n");
+
+	if (audio_active) {
+		err = usb_submit_urb(wired->audio_port.urb_in, GFP_KERNEL);
+		if (err) {
+			usb_kill_urb(wired->data_port.urb_in);
+			goto err_suspend;
+		}
+		dev_info(&intf->dev, "PM resume: audio input URB restarted\n");
+	}
+
+	dev_info(&intf->dev, "PM %s: USB transfers restarted\n",
+		 reset ? "reset_resume" : "resume");
+	dev_info(&intf->dev,
+		 "PM resume: pools data_idle_empty=%d data_busy_empty=%d audio_idle_empty=%d audio_busy_empty=%d\n",
+		 usb_anchor_empty(&wired->data_port.urbs_out_idle),
+		 usb_anchor_empty(&wired->data_port.urbs_out_busy),
+		 usb_anchor_empty(&wired->audio_port.urbs_out_idle),
+		 usb_anchor_empty(&wired->audio_port.urbs_out_busy));
+	err = 0;
+	goto unlock;
+
+err_suspend:
+	spin_lock_irqsave(&wired->io_lock, flags);
+	wired->suspended = true;
+	spin_unlock_irqrestore(&wired->io_lock, flags);
+	dev_err(&intf->dev, "%s: failed to restart USB transfers: %d\n",
+		__func__, err);
+unlock:
+	mutex_unlock(&wired->pm_lock);
+	return err;
+}
+
+static int xone_wired_resume(struct usb_interface *intf)
+{
+	return xone_wired_resume_common(intf, false);
+}
+
+static int xone_wired_reset_resume(struct usb_interface *intf)
+{
+	return xone_wired_resume_common(intf, true);
 }
 
 static const struct usb_device_id xone_wired_id_table[] = {
@@ -574,6 +868,11 @@ static struct usb_driver xone_wired_driver = {
 	.probe = xone_wired_probe,
 	.disconnect = xone_wired_disconnect,
 	.id_table = xone_wired_id_table,
+#ifdef CONFIG_PM
+	.suspend = xone_wired_suspend,
+	.resume = xone_wired_resume,
+	.reset_resume = xone_wired_reset_resume,
+#endif
 };
 
 module_usb_driver(xone_wired_driver);
