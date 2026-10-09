@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/hrtimer.h>
 #include <linux/atomic.h>
+#include <linux/kref.h>
 #include <linux/pm.h>
 #include <linux/version.h>
 #include <sound/core.h>
@@ -47,6 +48,8 @@ static const struct snd_pcm_hardware gip_headset_pcm_hw = {
 
 struct gip_headset {
 	struct gip_client *client;
+	struct kref refcount;
+	struct snd_card *card;
 	struct gip_battery battery;
 	struct gip_auth auth;
 
@@ -58,6 +61,7 @@ struct gip_headset {
 	struct work_struct work_register;
 	bool got_authenticated;
 	bool audio_initialized;
+	bool registration_started;
 	bool suspended;
 	bool resume_tracking;
 	atomic_t resume_audio_ready_count;
@@ -79,6 +83,27 @@ struct gip_headset {
 		snd_pcm_uframes_t period;
 	} playback, capture;
 };
+
+static void gip_headset_release(struct kref *ref)
+{
+	struct gip_headset *headset = container_of(ref, typeof(*headset),
+							 refcount);
+
+	kfree(headset->buffer);
+	kfree(headset);
+}
+
+static void gip_headset_put(void *data)
+{
+	struct gip_headset *headset = data;
+
+	kref_put(&headset->refcount, gip_headset_release);
+}
+
+static void gip_headset_card_free(struct snd_card *card)
+{
+	gip_headset_put(card->private_data);
+}
 
 static void gip_headset_log_resume_event(struct gip_headset *headset,
 					 atomic_t *counter,
@@ -362,10 +387,16 @@ static int gip_headset_init_pcm(struct gip_headset *headset)
 	struct snd_pcm *pcm;
 	int err;
 
-	err = snd_devm_card_new(&headset->client->dev, SNDRV_DEFAULT_IDX1,
-				SNDRV_DEFAULT_STR1, THIS_MODULE, 0, &card);
+	err = snd_card_new(&headset->client->dev, SNDRV_DEFAULT_IDX1,
+			   SNDRV_DEFAULT_STR1, THIS_MODULE, 0, &card);
 	if (err)
 		return err;
+
+	/* The card also holds the client device until its last file is closed. */
+	kref_get(&headset->refcount);
+	card->private_data = headset;
+	card->private_free = gip_headset_card_free;
+	headset->card = card;
 
 	strscpy(card->driver, "xone-gip-headset", sizeof(card->driver));
 	strscpy(card->shortname, GIP_HS_NAME, sizeof(card->shortname));
@@ -374,7 +405,7 @@ static int gip_headset_init_pcm(struct gip_headset *headset)
 
 	err = snd_pcm_new(card, GIP_HS_NAME, 0, 1, 1, &pcm);
 	if (err)
-		return err;
+		goto err_free_card;
 
 	strscpy(pcm->name, GIP_HS_NAME, sizeof(pcm->name));
 	pcm->private_data = headset;
@@ -383,7 +414,17 @@ static int gip_headset_init_pcm(struct gip_headset *headset)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &gip_headset_pcm_ops);
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 
-	return snd_card_register(card);
+	err = snd_card_register(card);
+	if (err)
+		goto err_free_card;
+
+	return 0;
+
+err_free_card:
+	headset->card = NULL;
+	/* Registration may already have published files; never wait for them. */
+	snd_card_free_when_closed(card);
+	return err;
 }
 
 static void gip_headset_config(struct work_struct *work)
@@ -487,17 +528,19 @@ static void gip_headset_register(struct work_struct *work)
 	int err;
 
 	if (READ_ONCE(headset->suspended) ||
-	    READ_ONCE(headset->audio_initialized))
+	    READ_ONCE(headset->registration_started))
 		return;
 
-	headset->buffer = devm_kzalloc(&client->dev,
-				       client->audio_config_out.buffer_size,
-				       GFP_KERNEL);
+	/* Failed/partial registration is rebuilt on a fresh GIP client. */
+	WRITE_ONCE(headset->registration_started, true);
+
+	headset->buffer = kzalloc(client->audio_config_out.buffer_size,
+				  GFP_KERNEL);
 	if (!headset->buffer)
 		return;
 
 	dev_dbg(&client->dev, "%s: init pcm device.\n", __func__);
-	err = snd_card_free_on_error(&client->dev, gip_headset_init_pcm(headset));
+	err = gip_headset_init_pcm(headset);
 	if (err) {
 		dev_err(&client->dev, "%s: init PCM failed: %d\n",
 			__func__, err);
@@ -649,9 +692,20 @@ static int gip_headset_probe(struct gip_client *client)
 	if (!fmts || !fmts->count)
 		return -ENODEV;
 
-	headset = devm_kzalloc(&client->dev, sizeof(*headset), GFP_KERNEL);
+	headset = kzalloc(sizeof(*headset), GFP_KERNEL);
 	if (!headset)
 		return -ENOMEM;
+	kref_init(&headset->refcount);
+
+	/*
+	 * Later auth/battery devres retain pointers into this object. Their
+	 * cleanup must finish before the last headset reference can disappear.
+	 * Register this guard first so it is released after those resources.
+	 */
+	kref_get(&headset->refcount);
+	err = devm_add_action_or_reset(&client->dev, gip_headset_put, headset);
+	if (err)
+		goto err_put_headset;
 
 	headset->client = client;
 	headset->chat_headset = client->hardware.vendor == GIP_VID_MICROSOFT &&
@@ -682,7 +736,7 @@ static int gip_headset_probe(struct gip_client *client)
 
 	err = gip_enable_audio(client);
 	if (err)
-		return err;
+		goto err_put_headset;
 
 	dev_set_drvdata(&client->dev, headset);
 
@@ -690,11 +744,16 @@ static int gip_headset_probe(struct gip_client *client)
 	schedule_work(&headset->work_config);
 
 	return 0;
+
+err_put_headset:
+	gip_headset_put(headset);
+	return err;
 }
 
 static void gip_headset_remove(struct gip_client *client)
 {
 	struct gip_headset *headset = dev_get_drvdata(&client->dev);
+	struct snd_card *card;
 
 	dev_info(&client->dev,
 		 "headset client remove: stopping audio work and disabling transport\n");
@@ -709,6 +768,13 @@ static void gip_headset_remove(struct gip_client *client)
 	/* A registration already in progress may have started this timer. */
 	hrtimer_cancel(&headset->timer);
 	gip_disable_audio(client);
+
+	card = headset->card;
+	headset->card = NULL;
+	dev_set_drvdata(&client->dev, NULL);
+	/* Old PCM callbacks retain the headset, buffer and inline client config. */
+	snd_card_free_when_closed(card);
+	gip_headset_put(headset);
 }
 
 static int gip_headset_suspend(struct device *dev)
@@ -761,8 +827,9 @@ static int gip_headset_resume(struct device *dev)
 	 * A failed initial registration may already own a PCM card or part of
 	 * the transport URB pool. Retrying configuration on that same client
 	 * would repeat those allocations. Rebuild incomplete clients too, so
-	 * removal releases their managed resources and disables audio before
-	 * the replacement is probed. Keep USB interface changes out of PM.
+	 * removal disconnects their PCM devices and disables audio before the
+	 * replacement is probed. Open files retain the old PCM resources until
+	 * they close. Keep USB interface changes out of PM.
 	 */
 
 	headset->start_counter = 0;
